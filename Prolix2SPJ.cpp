@@ -18,7 +18,7 @@ int main(int argc, char* argv[]) {
 		len = 48;
 	}
 	char blank[1024] = {'\0'};
-	char header[16] = {'C', 'B', 'N', 'F', (char)1, '\0', '\0', '\0', '\0', (char)1, (char)1, (char)(l1 % 256), (char)(l1 / 256), (char)ib, (char)ob, (char)len};
+	char header[16] = {'C', 'B', 'N', 'F', (char)1, '\0', (char)2, '\0', '\0', (char)1, (char)1, (char)(l1 % 256), (char)(l1 / 256), (char)ib, (char)ob, (char)len};
 	std::ofstream nnueconvert;
 	nnueconvert.open(name+".nnue", std::ofstream::binary);
 	nnueconvert.write(header, 16);
