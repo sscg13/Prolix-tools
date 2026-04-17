@@ -1,120 +1,221 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import argparse
+import time
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-import struct
+import torch
+import torch.optim as optim
+from dataclasses import dataclass
 
-class ChessBinaryDataset(Dataset):
-    def __init__(self, file_path):
-        raw_data = np.fromfile(file_path, dtype=np.uint8)
-        assert len(raw_data) % 48 == 0, "File size is not a multiple of 48 bytes!"
-        self.data = raw_data.reshape(-1, 48)
-        self.num_positions = len(self.data)
+import cpp_tuner 
 
-    def __len__(self):
-        return self.num_positions
+# --- 1. Dynamic Backend Registry ---
+# Easily add new tuners here without changing the training loop
+TUNER_BACKENDS = {
+    "material": {
+        "func": cpp_tuner.process_batch_material,
+        "num_features": 7  # 6 pieces + 1 bias
+    },
+    "prf": {
+        "func": cpp_tuner.process_batch_prf,
+        "num_features": 97 # 48 file + 48 rank + 1 bias
+    },
+    "psqt": {
+        "func": cpp_tuner.process_batch_psqt,
+        "num_features": 385 # 6 pieces * 64 squares + 1 bias
+    },
+    "kp": {
+        "func": cpp_tuner.process_batch_kp,
+        "num_features": 23233 # 704 base + 32 * 704 buckets + 1 bias
+    }
+}
 
-    def __getitem__(self, idx):
-        record = self.data[idx]
+# --- 2. Configuration Dataclass ---
+@dataclass
+class TunerConfig:
+    file_path: str
+    tuner_type: str
+    epochs: int
+    batch_size: int
+    lr: float
+    k: float
+    lambda_val: float
+
+# --- 3. The Tuner Class ---
+class ChessEngineTuner:
+    def __init__(self, config: TunerConfig):
+        self.config = config
         
-        # Parse Score and WDL
-        packed_val = struct.unpack('<h', record[40:42].tobytes())[0]
-        dataset_score = float(packed_val // 3)
-        wdl_result = float(packed_val % 3) / 2.0
-        
-        # Parse Mailbox and extract nibbles
-        mailbox = record[8:40]
-        squares = np.empty(64, dtype=np.uint8)
-        squares[0::2] = mailbox & 0x0F          
-        squares[1::2] = (mailbox >> 4) & 0x0F     
-        
-        # Branchless piece counting
-        counts = np.bincount(squares[squares != 15], minlength=12)
-        stm_counts = counts[0:6]
-        nstm_counts = counts[6:12]
-        
-        # Net Features [P, N, B, R, Q, K]
-        net_features = stm_counts - nstm_counts
+        if self.config.tuner_type not in TUNER_BACKENDS:
+            raise ValueError(f"Unknown tuner type: {self.config.tuner_type}")
             
-        return (
-            torch.tensor(net_features, dtype=torch.float32),
-            torch.tensor([dataset_score], dtype=torch.float32),
-            torch.tensor([wdl_result], dtype=torch.float32)
-        )
+        self.backend = TUNER_BACKENDS[self.config.tuner_type]
+        self.num_features = self.backend["num_features"]
+        self.cpp_process_func = self.backend["func"]
 
-class MaterialTuner(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weights = nn.Linear(6, 1, bias=True)
+        self._load_dataset()
+        self._setup_optimizer()
+
+    def _load_dataset(self):
+        print(f"Loading dataset from {self.config.file_path} into RAM...")
+        raw_data = np.fromfile(self.config.file_path, dtype=np.uint8)
+        self.dataset_tensor = torch.from_numpy(raw_data)
         
-        with torch.no_grad():
-            self.weights.weight.copy_(
-                torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
-            )
-            self.weights.bias.fill_(0.0)
+        self.total_positions = len(raw_data) // 48
+        print(f"Dataset contains {self.total_positions:,} positions.")
 
-    def forward(self, features):
-        return self.weights(features)
+        # Create the index array for blazing fast zero-copy shuffling
+        self.indices = torch.arange(self.total_positions, dtype=torch.int32)
+
+    def _setup_optimizer(self):
+        # Allocate Weights and explicitly allocate the gradient buffer for C++
+        self.weights = torch.zeros(self.num_features, dtype=torch.float32, requires_grad=True)
+        self.weights.grad = torch.zeros_like(self.weights)
+        self.optimizer = optim.Adam([self.weights], lr=self.config.lr)
+
+    def train(self):
+        print(f"\nStarting Training [{self.config.tuner_type.upper()} Tuner]...")
+        
+        for epoch in range(self.config.epochs):
+            total_loss = 0.0
+            positions_processed = 0
+            start_time = time.perf_counter()
+            
+            # Shuffle indices at the start of every epoch
+            self.indices = self.indices[torch.randperm(self.total_positions)]
+            
+            for start_idx in range(0, self.total_positions, self.config.batch_size):
+                current_batch_size = min(self.config.batch_size, self.total_positions - start_idx)
+                
+                self.weights.grad.zero_()
+                
+                # The C++ Black Box
+                batch_loss = self.cpp_process_func(
+                    start_idx,
+                    current_batch_size,
+                    self.config.k,
+                    self.config.lambda_val,
+                    self.weights,
+                    self.weights.grad,
+                    self.dataset_tensor,
+                    self.indices
+                )
+
+                self.optimizer.step()
+                
+                total_loss += batch_loss * current_batch_size
+                positions_processed += current_batch_size
+                
+            # Logging
+            elapsed_time = time.perf_counter() - start_time
+            pos_per_sec = positions_processed / elapsed_time
+            avg_loss = total_loss / self.total_positions
+            
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1:4d}/{self.config.epochs} | Loss: {avg_loss:.6f} | Speed: {pos_per_sec:,.0f} pos/sec")
+
+        print("\nTraining Complete!")
+
+    def export_weights(self):
+        weights_np = self.weights.data.cpu().numpy()
+        quantized_weights = np.round(weights_np * self.config.k).astype(np.int32).flatten()
+        num_params = len(quantized_weights)
+
+        if num_params < 1000:
+            print(f"\nFinal Quantized Weights ({self.config.tuner_type}):\n", quantized_weights)
+        else:
+            filename = f"{self.config.tuner_type}_weights.bin"
+            quantized_weights.astype('<i4').tofile(filename)
+            print(f"\n[Success] {num_params} weights exported to {filename}")
+            print(f"Format: Little-endian int32 (4 bytes per weight)")
+
+class EvalExporter:
+    def __init__(self, scale):
+        self.scale = scale
+
+    def export_material(self, raw_weights):
+        return raw_weights
+
+    def export_prf(self, raw_weights):
+        return raw_weights
     
-def blended_loss(eval_score, dataset_score, wdl_result, lam=0.5, k=400.0):
-    pred_prob = torch.sigmoid(eval_score)
-    dataset_prob = torch.sigmoid(dataset_score / k)
-    target = (1.0 - lam) * dataset_prob + lam * wdl_result
-    return torch.mean((pred_prob - target) ** 2)
+    def export_pst(self, raw_weights):
+        """
+        Unmirrors and merges factorized PST weights (199 features) 
+        into a flat PST array (385 features) for engine evaluation.
+        """
+        merged_weights = np.zeros(385, dtype=np.int32)
+        
+        # 1. Map Bias (Training index 0 -> Engine index 384)
+        merged_weights[384] = raw_weights[0]
+        
+        # 2. Merge Material and Mirrored PST into Flat PST
+        for p in range(6):
+            mat_val = raw_weights[1 + p]
+            for sq in range(64):
+                file = sq % 8
+                rank = sq // 8
+                
+                # Map full file (0-7) to mirrored file (0-3)
+                mirrored_file = 7 - file if file > 3 else file
+                mirrored_sq = rank * 4 + mirrored_file
+                
+                pst_delta = raw_weights[7 + p * 32 + mirrored_sq]
+                
+                # Engine array format: (piece * 64) + sq
+                merged_weights[p * 64 + sq] = mat_val + pst_delta
+                
+        return merged_weights
 
+    def export_weights(self, weights):
+        # 1. Extract and Quantize
+        weights_np = weights.data.cpu().numpy()
+        raw_weights = np.round(weights_np * self.scale).astype(np.int32).flatten()
+        
+        # 2. Dispatch Logic (Transform to engine-ready format)
+        # You can also trigger this via self.config.tuner_type == 'PST' if you prefer
+        if len(raw_weights) == 199: 
+            export_array = self.export_pst(raw_weights)
+        # elif len(raw_weights) == ... : 
+        #     export_array = self.export_kpst(raw_weights)
+        else:
+            export_array = raw_weights
+
+        # 3. Output / File I/O
+        num_params = len(export_array)
+
+        if num_params < 1000:
+            print(f"\nFinal Quantized Weights ({self.config.tuner_type}):\n", export_array)
+        else:
+            filename = f"{self.config.tuner_type}_weights.bin"
+            export_array.astype('<i4').tofile(filename)
+            print(f"\n[Success] {num_params} weights exported to {filename}")
+            print(f"Format: Little-endian int32 (4 bytes per weight)")
+
+        return export_array
+
+# --- 4. CLI Entry Point ---
 if __name__ == "__main__":
-    FILE_PATH = "data.bin"  # <--- Change this to your actual file
+    parser = argparse.ArgumentParser(description="High-Performance C++ Chess Tuner")
     
-    # Load dataset
-    dataset = ChessBinaryDataset(FILE_PATH)
-    print(f"Loaded {len(dataset)} positions.")
+    parser.add_argument("--data", type=str, default="data.bin", help="Path to the binary dataset")
+    parser.add_argument("--tuner", type=str, choices=TUNER_BACKENDS.keys(), default="material", help="Which feature extractor to use")
+    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=16384, help="Positions per batch")
+    parser.add_argument("--lr", type=float, default=0.001, help="Adam learning rate")
+    parser.add_argument("--k", type=float, default=400.0, help="Sigmoid scaling factor")
+    parser.add_argument("--lam", type=float, default=1.0, help="WDL interpolation lambda")
     
-    # Full-batch gradient descent: batch_size = len(dataset)
-    dataloader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+    args = parser.parse_args()
     
-    model = MaterialTuner()
-    all_wdls = []
-    for _, _, wdl in dataloader:
-        all_wdls.append(wdl)
-    print("WDL Distribution:", torch.unique(torch.cat(all_wdls), return_counts=True))
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    config = TunerConfig(
+        file_path=args.data,
+        tuner_type=args.tuner,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        k=args.k,
+        lambda_val=args.lam
+    )
     
-    epochs = 1000
-    k = 400
-    lam = 1.0
-    
-    print("\nStarting Training...")
-    print(f"Initial Weights: {model.weights.weight.data.round().int().tolist()[0]}")
-    
-    # Since there is only 1 batch, we can just grab it once to save overhead
-    features, dataset_score, wdl_result = next(iter(dataloader))
-    
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        
-        current_eval = model(features)
-        loss = blended_loss(current_eval, dataset_score, wdl_result, lam, k)
-        
-        loss.backward()
-        optimizer.step()
-        
-        if (epoch + 1) % 100 == 0:
-            print(f"Epoch {epoch+1:4d}/{epochs} | Loss: {loss.item():.6f}")
-            
-    print("\nTraining Complete!")
-    print(f"Final Float Weights: {model.weights.weight.data.tolist()[0]}")
-    print(f"Final Float Bias:  {model.weights.bias.data.item()}")
-    
-    raw_weights = model.weights.weight.data
-    raw_bias = model.weights.bias.data
-    quantized_weights = (raw_weights * k).round().int().tolist()[0]
-    quantized_bias = (raw_bias * k).round().int().item()
-    print(f"\nFinal Quantized Weights (Export to C++):")
-    print(f"P: {quantized_weights[0]}")
-    print(f"B: {quantized_weights[1]}")
-    print(f"Q: {quantized_weights[2]}")
-    print(f"N: {quantized_weights[3]}")
-    print(f"R: {quantized_weights[4]}")
-    print(f"K: {quantized_weights[5]}  <-- Should still be 0!")
-    print(f"Tempo: {quantized_bias}")
+    tuner = ChessEngineTuner(config)
+    tuner.train()
+    tuner.export_weights()
