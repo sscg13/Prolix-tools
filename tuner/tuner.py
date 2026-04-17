@@ -57,7 +57,7 @@ TUNER_BACKENDS = {
     },
     "psqt": {
         "func": cpp_tuner.process_batch_psqt,
-        "num_features": 385,  # 6 pieces * 64 squares + 1 bias
+        "num_features": 199,  # 1 bias + 6 pieces + 6 pieces * 32 squares
         "export_func": export_psqt,
     },
     "kp": {
