@@ -16,7 +16,7 @@ def export_prf(raw_weights):
 
 def export_psqt(raw_weights):
     """
-    Unmirrors and merges factorized PST weights (199 features)
+    Merges factorized PST weights (391 features)
     into a flat PST array (385 features) for engine evaluation.
     """
     merged_weights = np.zeros(385, dtype=np.int32)
@@ -24,23 +24,119 @@ def export_psqt(raw_weights):
     # Map Bias (Training index 0 -> Engine index 384)
     merged_weights[384] = raw_weights[0]
 
-    # Merge Material and Mirrored PST into Flat PST
+    # Merge Material and PST into Flat PST
     for p in range(6):
         mat_val = raw_weights[1 + p]
         for sq in range(64):
-            file = sq % 8
-            rank = sq // 8
-
-            mirrored_file = 7 - file if file > 3 else file
-            mirrored_sq = rank * 4 + mirrored_file
-
-            pst_delta = raw_weights[7 + p * 32 + mirrored_sq]
+            pst_delta = raw_weights[7 + p * 64 + sq]
             merged_weights[p * 64 + sq] = mat_val + pst_delta
 
     return merged_weights
 
 def export_kp(raw_weights):
+    """
+    Merges factorized KP weights into the flat bucketed form used by the engine.
+
+    Raw layout (23233 = 704 + 32*704 + 1):
+      [0 .. 703]       : P base weights, indexed as pt * 64 + sq
+                         (11 piece types: 0-4 friendly, 5-9 enemy, 10 enemy king)
+      [704 .. 23231]   : KP bucket weights, indexed as
+                           704 + (k_idx * 11 + pt) * 64 + sq
+                         for k_idx in [0, 32) (king bucket)
+      [23232]          : STM-advantage bias
+
+    Merged layout (22529 = 32*704 + 1):
+      [0 .. 22527] : KP weights, indexed as (k_idx * 11 + pt) * 64 + sq,
+                     with P base folded into every bucket.
+      [22528]      : Bias.
+    """
+    merged = np.zeros(22529, dtype=np.int32)
+    p_base  = raw_weights[:704]                            # (704,)
+    kp_flat = raw_weights[704:23232].reshape(32, 704)      # (k_idx, pt*64+sq)
+    merged[:22528] = (kp_flat + p_base[None, :]).reshape(-1)
+    merged[22528]  = raw_weights[23232]
+    return merged
+
+
+# Lazy cache for the PP canonical pair-index map (built on first export).
+_PP_PAIR_DATA = None
+_PP_NUM_CANONICAL = 147072
+
+def _build_pp_pair_data():
+    """Mirrors the C++ PPInit logic so exported indices match training indices."""
+    global _PP_PAIR_DATA
+    if _PP_PAIR_DATA is not None:
+        return _PP_PAIR_DATA
+    N = 768
+    pair_data = np.full(N * N, -1, dtype=np.int64)
+    next_idx = 0
+    for a in range(N):
+        pt_a, sq_a = divmod(a, 64)
+        fa = ((pt_a + 6) % 12) * 64 + (sq_a ^ 56)
+        row_a = a * N
+        for b in range(a + 1, N):
+            if pair_data[row_a + b] != -1:
+                continue
+            pt_b, sq_b = divmod(b, 64)
+            fb = ((pt_b + 6) % 12) * 64 + (sq_b ^ 56)
+            a2, b2 = (fa, fb) if fa < fb else (fb, fa)
+            if a == a2 and b == b2:
+                pair_data[row_a + b] = -2
+                pair_data[b * N + a] = -2
+                continue
+            code_pos = next_idx << 1
+            code_neg = code_pos | 1
+            pair_data[row_a + b]    = code_pos
+            pair_data[b * N + a]    = code_pos
+            pair_data[a2 * N + b2]  = code_neg
+            pair_data[b2 * N + a2]  = code_neg
+            next_idx += 1
+    assert next_idx == _PP_NUM_CANONICAL, (
+        f"PP canonical count mismatch: built {next_idx}, expected {_PP_NUM_CANONICAL}"
+    )
+    _PP_PAIR_DATA = pair_data
+    return pair_data
+
+
+def export_pp(raw_weights):
+    """
+    Expands the 147072 canonical PP weights (+ bias) into a dense 768x768
+    matrix (+ bias) for the engine.
+
+    Output layout (589825 = 768*768 + 1):
+      [i * 768 + j] = weight of piece pair (i, j), where i,j in [0, 768).
+                      Satisfies W[i][j] = W[j][i]
+                        and      W[i][j] = -W[flip(i)][flip(j)],
+                      with flip(f) = ((pt+6) % 12) * 64 + (sq ^ 56).
+      [768 * 768]   = Bias.
+    Self-symmetric pairs (those equal to their own flip as an unordered pair)
+    are pinned to 0.
+    """
+    N = 768
+    pair_data = _build_pp_pair_data()
+    out = np.zeros(N * N + 1, dtype=np.int32)
+
+    # Vectorised expansion.
+    d = pair_data
+    valid = d >= 0
+    idx   = (d >> 1).astype(np.int64)
+    sign  = np.where((d & 1) == 1, -1, 1).astype(np.int32)
+    # Gather canonical weights for valid entries.
+    flat  = np.zeros(N * N, dtype=np.int32)
+    canon = raw_weights[:_PP_NUM_CANONICAL].astype(np.int32)
+    flat[valid] = sign[valid] * canon[idx[valid]]
+    out[:N * N]  = flat
+    out[N * N]   = raw_weights[_PP_NUM_CANONICAL]
+    return out
+
+
+def export_ppxk(raw_weights):
+    """
+    PPxK has no compression in the parameter space; the raw weights are
+    already the full [768*768] PP tensor + [64*64] K tensor + bias.
+    """
     return raw_weights
+
 
 # --- 2. Dynamic Backend Registry ---
 # Easily add new tuners here without changing the training loop
@@ -57,14 +153,24 @@ TUNER_BACKENDS = {
     },
     "psqt": {
         "func": cpp_tuner.process_batch_psqt,
-        "num_features": 199,  # 1 bias + 6 pieces + 6 pieces * 32 squares
+        "num_features": 391,  # 1 bias + 6 material + 6 pieces * 64 squares
         "export_func": export_psqt,
     },
     "kp": {
         "func": cpp_tuner.process_batch_kp,
         "num_features": 23233,  # 704 base + 32 * 704 buckets + 1 bias
         "export_func": export_kp,
-    }
+    },
+    "pp": {
+        "func": cpp_tuner.process_batch_pp,
+        "num_features": 147073,  # 147072 canonical pairs + 1 bias
+        "export_func": export_pp,
+    },
+    "ppxk": {
+        "func": cpp_tuner.process_batch_ppxk,
+        "num_features": 593921,  # 768*768 PP + 64*64 K + 1 bias
+        "export_func": export_ppxk,
+    },
 }
 
 # --- 3. Configuration Dataclass ---
@@ -179,7 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--tuner", type=str, choices=TUNER_BACKENDS.keys(), default="material", help="Which feature extractor to use")
     parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=16384, help="Positions per batch")
-    parser.add_argument("--lr", type=float, default=0.001, help="Adam learning rate")
+    parser.add_argument("--lr", type=float, default=0.001, help="AdamW learning rate")
     parser.add_argument("--k", type=float, default=400.0, help="Sigmoid scaling factor")
     parser.add_argument("--lam", type=float, default=1.0, help="WDL interpolation lambda")
 

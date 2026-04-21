@@ -117,40 +117,34 @@ struct PRFExtractor {
 };
 
 struct PSTExtractor {
-    static constexpr int NUM_FEATURES = 199; // 1 Bias + 6 Material + 192 Mirrored PST
+    static constexpr int NUM_FEATURES = 391; // 1 Bias + 6 Material + 384 Full PST
     static constexpr int MAX_ACTIVE = 65;    // Max 32 pieces * 2 features + 1 bias
 
     static inline float forward(const UnpackedBoard& board, const float* weights, ActiveFeatures<MAX_ACTIVE>& features) {
         float eval = 0.0f;
-        
+
         // --- 1. Global Bias ---
         features.add(0, 1.0f);
         eval += weights[0];
-        
+
         // --- 2. Extract Factorized Features ---
         uint64_t occ = board.occupancy;
         while (occ) {
-            int sq = get_lsb(occ); 
-            occ &= occ - 1; 
-            
-            uint8_t piece = board.mailbox[sq]; 
-            int base_piece = piece % 6; 
+            int sq = get_lsb(occ);
+            occ &= occ - 1;
+
+            uint8_t piece = board.mailbox[sq];
+            int base_piece = piece % 6;
             bool is_stm = (piece < 6);
-            
+
             // Perspective flip
-            int relative_sq = is_stm ? sq : (sq ^ 56); 
+            int relative_sq = is_stm ? sq : (sq ^ 56);
             float coeff = is_stm ? 1.0f : -1.0f;
-            
-            // Horizontal Mirroring (Fold files E-H into A-D)
-            int file = relative_sq % 8;
-            int rank = relative_sq / 8;
-            int mirrored_file = (file > 3) ? (7 - file) : file;
-            int mirrored_sq = (rank * 4) + mirrored_file; // Range: 0 to 31
-            
+
             // Calculate Indices
             int mat_idx = 1 + base_piece;
-            int pst_idx = 7 + (base_piece * 32) + mirrored_sq;
-            
+            int pst_idx = 7 + (base_piece * 64) + relative_sq;
+
             // Add Base Material
             features.add(mat_idx, coeff);
             eval += coeff * weights[mat_idx];
@@ -159,7 +153,199 @@ struct PSTExtractor {
             features.add(pst_idx, coeff);
             eval += coeff * weights[pst_idx];
         }
-        
+
+        return eval;
+    }
+};
+
+// ====================================================================
+//                         PP Extractor
+// ====================================================================
+// Weight for each unordered pair of pieces on the board.
+// Features are indexed by (piece_type, square) in [0, 768):
+//   piece_type in [0, 12)  -> 0-5 STM, 6-11 NSTM (5 = STM king, 11 = NSTM king)
+//   feat = pt * 64 + sq
+//
+// Two symmetries are baked into the weight space:
+//   (a) Pair symmetry:      w[i][j] = w[j][i]   (undirected pair)
+//   (b) Vertical symmetry:  w[i][j] = -w[flip(i)][flip(j)]
+//       where flip(feat) = ((pt+6)%12) * 64 + (sq ^ 56)
+// This enforces that the evaluation is side-to-move agnostic:
+// color-swapping + mirroring the board negates the eval.
+//
+// A static lookup table maps any ordered pair (fi, fj) in [0,768)^2 to
+// an encoded canonical (index, sign) for gradient accumulation.
+// Encoding: code = (canonical_index << 1) | sign_bit ;  -1 = unfilled ; -2 = self-symmetric.
+// ====================================================================
+constexpr int PP_DIM = 768;
+
+static inline int pp_flip_feat(int f) {
+    int pt = f / 64, sq = f % 64;
+    return ((pt + 6) % 12) * 64 + (sq ^ 56);
+}
+
+struct PPInit {
+    int32_t pair_data[PP_DIM * PP_DIM];
+    int num_canonical;
+
+    PPInit() {
+        for (int i = 0; i < PP_DIM * PP_DIM; ++i) pair_data[i] = -1;
+        int next_idx = 0;
+        for (int a = 0; a < PP_DIM; ++a) {
+            int fa = pp_flip_feat(a);
+            for (int b = a + 1; b < PP_DIM; ++b) {
+                if (pair_data[a * PP_DIM + b] != -1) continue;
+                int fb = pp_flip_feat(b);
+                int a2 = std::min(fa, fb), b2 = std::max(fa, fb);
+                if (a == a2 && b == b2) {
+                    // Pair is its own mirror image -> weight = 0 (constraint), skip.
+                    pair_data[a * PP_DIM + b] = -2;
+                    pair_data[b * PP_DIM + a] = -2;
+                    continue;
+                }
+                // (a,b) < (a2,b2) lexicographically because outer loop visits canonical first.
+                int code_pos = next_idx << 1;
+                int code_neg = (next_idx << 1) | 1;
+                pair_data[a * PP_DIM + b]   = code_pos;
+                pair_data[b * PP_DIM + a]   = code_pos;
+                pair_data[a2 * PP_DIM + b2] = code_neg;
+                pair_data[b2 * PP_DIM + a2] = code_neg;
+                ++next_idx;
+            }
+        }
+        num_canonical = next_idx; // expected: 147072
+    }
+};
+
+static PPInit g_pp_init;
+
+struct PPExtractor {
+    static constexpr int NUM_FEATURES = 147072 + 1; // canonical pairs + bias
+    static constexpr int MAX_ACTIVE   = 32 * 31 / 2 + 1; // C(32,2) pairs + bias
+
+    static inline float forward(const UnpackedBoard& board, const float* weights,
+                                ActiveFeatures<MAX_ACTIVE>& features) {
+        const int bias_idx = NUM_FEATURES - 1;
+        float eval = weights[bias_idx];
+        features.add(bias_idx, 1.0f);
+
+        // Collect piece features (piece_type * 64 + sq) from STM-relative board.
+        int feats[32];
+        int n = 0;
+        uint64_t occ = board.occupancy;
+        while (occ) {
+            int sq = get_lsb(occ);
+            occ &= occ - 1;
+            int p = board.mailbox[sq];
+            feats[n++] = p * 64 + sq;
+        }
+
+        // Iterate unordered pairs.
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                int32_t data = g_pp_init.pair_data[feats[i] * PP_DIM + feats[j]];
+                if (data < 0) continue; // self-symmetric (-2) — weight pinned at 0.
+                int idx = data >> 1;
+                float coeff = (data & 1) ? -1.0f : 1.0f;
+                features.add(idx, coeff);
+                eval += coeff * weights[idx];
+            }
+        }
+        return eval;
+    }
+};
+
+// ====================================================================
+//                         PPxK Extractor
+// ====================================================================
+// For each perspective (STM, NSTM), compute 64 intermediate values
+// (one per square):
+//   I[sq] = sum over ordered piece pairs (a,b), a != b, with sq_a == sq of
+//           W[feat_a * 768 + feat_b]
+// Equivalently, for each unordered pair {i,j}, W[feat_i * 768 + feat_j]
+// flows into I[sq_i], while W[feat_j * 768 + feat_i] flows into I[sq_j].
+// Then reduce via king squares:
+//   reduced = sum_sq K[king_sq * 64 + sq] * I[sq]
+// Final:
+//   eval = reduced_stm - reduced_nstm + bias
+//
+// This is side-to-move agnostic by construction: swapping stm/nstm and
+// mirroring the board swaps the two reduced terms, negating the eval.
+// No internal symmetry constraint is imposed on W or K.
+// ====================================================================
+struct PPxKExtractor {
+    static constexpr int NUM_PP       = 768 * 768;
+    static constexpr int NUM_K        = 64 * 64;
+    static constexpr int NUM_FEATURES = NUM_PP + NUM_K + 1;
+    // Per perspective: 32*31 ordered-pair W features + 64 K features.
+    // Two perspectives + bias.
+    static constexpr int MAX_ACTIVE   = 2 * (32 * 31) + 2 * 64 + 1;
+
+    static inline float forward(const UnpackedBoard& board, const float* weights,
+                                ActiveFeatures<MAX_ACTIVE>& features) {
+        const float* W = weights;                // [768 * 768]
+        const float* K = weights + NUM_PP;       // [64 * 64]
+        const int bias_idx = NUM_FEATURES - 1;
+
+        float eval = weights[bias_idx];
+        features.add(bias_idx, 1.0f);
+
+        // Gather pieces in STM and NSTM perspectives.
+        int feats_stm[32], sqs_stm[32];
+        int feats_nstm[32], sqs_nstm[32];
+        int n = 0;
+        uint64_t occ = board.occupancy;
+        while (occ) {
+            int sq = get_lsb(occ);
+            occ &= occ - 1;
+            int p = board.mailbox[sq];
+            feats_stm[n]  = p * 64 + sq;
+            sqs_stm[n]    = sq;
+            int p_n  = (p + 6) % 12;
+            int sq_n = sq ^ 56;
+            feats_nstm[n] = p_n * 64 + sq_n;
+            sqs_nstm[n]   = sq_n;
+            ++n;
+        }
+
+        const int stm_king  = board.stm_king_sq;
+        const int nstm_king = board.nstm_king_sq ^ 56; // into NSTM's own view
+
+        float I_stm[64]  = {0.0f};
+        float I_nstm[64] = {0.0f};
+
+        // Iterate ordered pairs; each unordered pair is visited twice,
+        // once contributing W[i][j] -> I[sq_i], once W[j][i] -> I[sq_j].
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                if (i == j) continue;
+
+                // STM perspective
+                int   w_idx_s = feats_stm[i] * 768 + feats_stm[j];
+                int   sq_s    = sqs_stm[i];
+                float w_s     = W[w_idx_s];
+                float k_s     = K[stm_king * 64 + sq_s];
+                I_stm[sq_s]  += w_s;
+                features.add(w_idx_s, k_s);        // dEval/dW = +K
+                eval         += k_s * w_s;
+
+                // NSTM perspective
+                int   w_idx_n = feats_nstm[i] * 768 + feats_nstm[j];
+                int   sq_n    = sqs_nstm[i];
+                float w_n     = W[w_idx_n];
+                float k_n     = K[nstm_king * 64 + sq_n];
+                I_nstm[sq_n] += w_n;
+                features.add(w_idx_n, -k_n);       // dEval/dW = -K
+                eval         -= k_n * w_n;
+            }
+        }
+
+        // K features: gradient wrt K[king][sq] is +-I[sq].
+        for (int sq = 0; sq < 64; ++sq) {
+            features.add(NUM_PP + stm_king  * 64 + sq,  I_stm[sq]);
+            features.add(NUM_PP + nstm_king * 64 + sq, -I_nstm[sq]);
+        }
+
         return eval;
     }
 };
@@ -318,4 +504,6 @@ PYBIND11_MODULE(cpp_tuner, m) {
     m.def("process_batch_prf", &process_batch_impl<PRFExtractor>);
     m.def("process_batch_psqt", &process_batch_impl<PSTExtractor>);
     m.def("process_batch_kp", &process_batch_impl<KPExtractor>);
+    m.def("process_batch_pp", &process_batch_impl<PPExtractor>);
+    m.def("process_batch_ppxk", &process_batch_impl<PPxKExtractor>);
 }
