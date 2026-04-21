@@ -165,62 +165,38 @@ struct PSTExtractor {
 // Features are indexed by (piece_type, square) in [0, 768):
 //   piece_type in [0, 12)  -> 0-5 STM, 6-11 NSTM (5 = STM king, 11 = NSTM king)
 //   feat = pt * 64 + sq
+//   STM features: [0, 384),  NSTM features: [384, 768)
 //
-// Two symmetries are baked into the weight space:
-//   (a) Pair symmetry:      w[i][j] = w[j][i]   (undirected pair)
-//   (b) Vertical symmetry:  w[i][j] = -w[flip(i)][flip(j)]
-//       where flip(feat) = ((pt+6)%12) * 64 + (sq ^ 56)
-// This enforces that the evaluation is side-to-move agnostic:
-// color-swapping + mirroring the board negates the eval.
+// Two symmetries reduce the parameter space to 147072 canonical weights:
 //
-// A static lookup table maps any ordered pair (fi, fj) in [0,768)^2 to
-// an encoded canonical (index, sign) for gradient accumulation.
-// Encoding: code = (canonical_index << 1) | sign_bit ;  -1 = unfilled ; -2 = self-symmetric.
+// (a) Vertical symmetry: w[i][j] = -w[flip(i)][flip(j)]
+//       flip(f) = ((pt+6)%12)*64 + (sq^56)  -- swaps colors and mirrors ranks
+//     This folds NSTM-NSTM pairs into the STM-STM triangular block (with negation),
+//     and halves the STM-NSTM subspace.
+//
+// (b) Pair symmetry: w[i][j] = w[j][i]  -- unordered pairs, triangular indexing.
+//
+// Index layout (PP_HALF = 384, PP_SS = PP_HALF*(PP_HALF-1)/2 = 73536):
+//   [0,       PP_SS)  : STM-STM pairs, idx = b*(b-1)/2 + a,  0 <= a < b < PP_HALF
+//                       NSTM-NSTM pairs map here via flip with sign -1.
+//   [PP_SS, 2*PP_SS)  : STM-NSTM pairs, idx = PP_SS + bp*(bp-1)/2 + a,
+//                       where a = STM feature, bp = flip(NSTM feature),
+//                       canonical: a < bp (swap + negate if a > bp).
+//                       Self-symmetric pairs (a == bp) have weight pinned to 0.
+//   [2*PP_SS]         : Bias.
+//
+// Engine indexing uses the same formula with one helper: pp_flip(f).
 // ====================================================================
-constexpr int PP_DIM = 768;
+static constexpr int PP_HALF = 6 * 64;                        // 384
+static constexpr int PP_SS   = PP_HALF * (PP_HALF - 1) / 2;  // 73536
 
-static inline int pp_flip_feat(int f) {
+static inline int pp_flip(int f) {
     int pt = f / 64, sq = f % 64;
     return ((pt + 6) % 12) * 64 + (sq ^ 56);
 }
 
-struct PPInit {
-    int32_t pair_data[PP_DIM * PP_DIM];
-    int num_canonical;
-
-    PPInit() {
-        for (int i = 0; i < PP_DIM * PP_DIM; ++i) pair_data[i] = -1;
-        int next_idx = 0;
-        for (int a = 0; a < PP_DIM; ++a) {
-            int fa = pp_flip_feat(a);
-            for (int b = a + 1; b < PP_DIM; ++b) {
-                if (pair_data[a * PP_DIM + b] != -1) continue;
-                int fb = pp_flip_feat(b);
-                int a2 = std::min(fa, fb), b2 = std::max(fa, fb);
-                if (a == a2 && b == b2) {
-                    // Pair is its own mirror image -> weight = 0 (constraint), skip.
-                    pair_data[a * PP_DIM + b] = -2;
-                    pair_data[b * PP_DIM + a] = -2;
-                    continue;
-                }
-                // (a,b) < (a2,b2) lexicographically because outer loop visits canonical first.
-                int code_pos = next_idx << 1;
-                int code_neg = (next_idx << 1) | 1;
-                pair_data[a * PP_DIM + b]   = code_pos;
-                pair_data[b * PP_DIM + a]   = code_pos;
-                pair_data[a2 * PP_DIM + b2] = code_neg;
-                pair_data[b2 * PP_DIM + a2] = code_neg;
-                ++next_idx;
-            }
-        }
-        num_canonical = next_idx; // expected: 147072
-    }
-};
-
-static PPInit g_pp_init;
-
 struct PPExtractor {
-    static constexpr int NUM_FEATURES = 147072 + 1; // canonical pairs + bias
+    static constexpr int NUM_FEATURES = PP_SS * 2 + 1; // 147072 pairs + bias
     static constexpr int MAX_ACTIVE   = 32 * 31 / 2 + 1; // C(32,2) pairs + bias
 
     static inline float forward(const UnpackedBoard& board, const float* weights,
@@ -240,15 +216,30 @@ struct PPExtractor {
             feats[n++] = p * 64 + sq;
         }
 
-        // Iterate unordered pairs.
         for (int i = 0; i < n; ++i) {
             for (int j = i + 1; j < n; ++j) {
-                int32_t data = g_pp_init.pair_data[feats[i] * PP_DIM + feats[j]];
-                if (data < 0) continue; // self-symmetric (-2) — weight pinned at 0.
-                int idx = data >> 1;
-                float coeff = (data & 1) ? -1.0f : 1.0f;
-                features.add(idx, coeff);
-                eval += coeff * weights[idx];
+                int fi = feats[i], fj = feats[j];
+                bool si = fi < PP_HALF, sj = fj < PP_HALF;
+                float sign = 1.0f;
+                int idx;
+
+                if (si == sj) {
+                    // Both STM or both NSTM: vertical flip folds NSTM-NSTM into STM-STM.
+                    if (!si) { fi = pp_flip(fi); fj = pp_flip(fj); sign = -1.0f; }
+                    int a = std::min(fi, fj), b = std::max(fi, fj);
+                    idx = b * (b - 1) / 2 + a;
+                } else {
+                    // Mixed: ensure fi is STM, then reduce via flip of the NSTM feature.
+                    if (!si) std::swap(fi, fj);
+                    int a  = fi;
+                    int bp = pp_flip(fj); // flip(NSTM) -> STM feature in [0, PP_HALF)
+                    if (a == bp) continue; // self-symmetric, weight pinned to 0
+                    if (a > bp) { std::swap(a, bp); sign = -1.0f; }
+                    idx = PP_SS + bp * (bp - 1) / 2 + a;
+                }
+
+                features.add(idx, sign);
+                eval += sign * weights[idx];
             }
         }
         return eval;

@@ -53,76 +53,6 @@ def export_kp(raw_weights):
     return merged
 
 
-# Lazy cache for the PP canonical pair-index map (built on first export).
-_PP_PAIR_DATA = None
-_PP_NUM_CANONICAL = 147072
-
-def _build_pp_pair_data():
-    """Mirrors the C++ PPInit logic so exported indices match training indices."""
-    global _PP_PAIR_DATA
-    if _PP_PAIR_DATA is not None:
-        return _PP_PAIR_DATA
-    N = 768
-    pair_data = np.full(N * N, -1, dtype=np.int64)
-    next_idx = 0
-    for a in range(N):
-        pt_a, sq_a = divmod(a, 64)
-        fa = ((pt_a + 6) % 12) * 64 + (sq_a ^ 56)
-        row_a = a * N
-        for b in range(a + 1, N):
-            if pair_data[row_a + b] != -1:
-                continue
-            pt_b, sq_b = divmod(b, 64)
-            fb = ((pt_b + 6) % 12) * 64 + (sq_b ^ 56)
-            a2, b2 = (fa, fb) if fa < fb else (fb, fa)
-            if a == a2 and b == b2:
-                pair_data[row_a + b] = -2
-                pair_data[b * N + a] = -2
-                continue
-            code_pos = next_idx << 1
-            code_neg = code_pos | 1
-            pair_data[row_a + b]    = code_pos
-            pair_data[b * N + a]    = code_pos
-            pair_data[a2 * N + b2]  = code_neg
-            pair_data[b2 * N + a2]  = code_neg
-            next_idx += 1
-    assert next_idx == _PP_NUM_CANONICAL, (
-        f"PP canonical count mismatch: built {next_idx}, expected {_PP_NUM_CANONICAL}"
-    )
-    _PP_PAIR_DATA = pair_data
-    return pair_data
-
-
-def export_pp(raw_weights):
-    """
-    Expands the 147072 canonical PP weights (+ bias) into a dense 768x768
-    matrix (+ bias) for the engine.
-
-    Output layout (589825 = 768*768 + 1):
-      [i * 768 + j] = weight of piece pair (i, j), where i,j in [0, 768).
-                      Satisfies W[i][j] = W[j][i]
-                        and      W[i][j] = -W[flip(i)][flip(j)],
-                      with flip(f) = ((pt+6) % 12) * 64 + (sq ^ 56).
-      [768 * 768]   = Bias.
-    Self-symmetric pairs (those equal to their own flip as an unordered pair)
-    are pinned to 0.
-    """
-    N = 768
-    pair_data = _build_pp_pair_data()
-    out = np.zeros(N * N + 1, dtype=np.int32)
-
-    # Vectorised expansion.
-    d = pair_data
-    valid = d >= 0
-    idx   = (d >> 1).astype(np.int64)
-    sign  = np.where((d & 1) == 1, -1, 1).astype(np.int32)
-    # Gather canonical weights for valid entries.
-    flat  = np.zeros(N * N, dtype=np.int32)
-    canon = raw_weights[:_PP_NUM_CANONICAL].astype(np.int32)
-    flat[valid] = sign[valid] * canon[idx[valid]]
-    out[:N * N]  = flat
-    out[N * N]   = raw_weights[_PP_NUM_CANONICAL]
-    return out
 
 
 
@@ -152,8 +82,8 @@ TUNER_BACKENDS = {
     },
     "pp": {
         "func": cpp_tuner.process_batch_pp,
-        "num_features": 147073,  # 147072 canonical pairs + 1 bias
-        "export_func": export_pp,
+        "num_features": 147073,  # 2 * C(384,2) canonical pairs + 1 bias
+        "export_func": None,
     },
     "ppxk": {
         "func": cpp_tuner.process_batch_ppxk,
