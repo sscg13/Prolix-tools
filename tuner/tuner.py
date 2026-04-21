@@ -8,11 +8,6 @@ from dataclasses import dataclass
 import cpp_tuner
 
 # --- 1. Export Functions ---
-def export_material(raw_weights):
-    return raw_weights
-
-def export_prf(raw_weights):
-    return raw_weights
 
 def export_psqt(raw_weights):
     """
@@ -130,12 +125,6 @@ def export_pp(raw_weights):
     return out
 
 
-def export_ppxk(raw_weights):
-    """
-    PPxK has no compression in the parameter space; the raw weights are
-    already the full [768*768] PP tensor + [64*64] K tensor + bias.
-    """
-    return raw_weights
 
 
 # --- 2. Dynamic Backend Registry ---
@@ -144,12 +133,12 @@ TUNER_BACKENDS = {
     "material": {
         "func": cpp_tuner.process_batch_material,
         "num_features": 7,  # 6 pieces + 1 bias
-        "export_func": export_material,
+        "export_func": None,
     },
     "prf": {
         "func": cpp_tuner.process_batch_prf,
         "num_features": 97,  # 48 file + 48 rank + 1 bias
-        "export_func": export_prf,
+        "export_func": None,
     },
     "psqt": {
         "func": cpp_tuner.process_batch_psqt,
@@ -169,7 +158,7 @@ TUNER_BACKENDS = {
     "ppxk": {
         "func": cpp_tuner.process_batch_ppxk,
         "num_features": 593921,  # 768*768 PP + 64*64 K + 1 bias
-        "export_func": export_ppxk,
+        "export_func": None,
     },
 }
 
@@ -262,20 +251,31 @@ class ChessEngineTuner:
     def export_weights(self):
         weights_np = self.weights.data.cpu().numpy()
         raw_weights = np.round(weights_np * self.config.k).astype(np.int32).flatten()
-        export_array = self.backend["export_func"](raw_weights)
 
         t = self.config.tuner_type
-        if len(raw_weights) < 1000:
-            print(f"\nRaw Weights ({t}):\n", raw_weights)
-            print(f"\nMerged Weights ({t}):\n", export_array)
+        export_func = self.backend["export_func"]
+
+        if export_func is None:
+            if len(raw_weights) < 1000:
+                print(f"\nRaw Weights ({t}):\n", raw_weights)
+            else:
+                raw_filename = f"{t}_weights_raw.bin"
+                raw_weights.astype('<i4').tofile(raw_filename)
+                print(f"\n[Success] {len(raw_weights)} raw weights exported to {raw_filename}")
+                print(f"Format: Little-endian int32 (4 bytes per weight)")
         else:
-            raw_filename = f"{t}_weights_raw.bin"
-            merged_filename = f"{t}_weights_merged.bin"
-            raw_weights.astype('<i4').tofile(raw_filename)
-            export_array.astype('<i4').tofile(merged_filename)
-            print(f"\n[Success] {len(raw_weights)} raw weights exported to {raw_filename}")
-            print(f"[Success] {len(export_array)} merged weights exported to {merged_filename}")
-            print(f"Format: Little-endian int32 (4 bytes per weight)")
+            export_array = export_func(raw_weights)
+            if len(raw_weights) < 1000:
+                print(f"\nRaw Weights ({t}):\n", raw_weights)
+                print(f"\nMerged Weights ({t}):\n", export_array)
+            else:
+                raw_filename = f"{t}_weights_raw.bin"
+                merged_filename = f"{t}_weights_merged.bin"
+                raw_weights.astype('<i4').tofile(raw_filename)
+                export_array.astype('<i4').tofile(merged_filename)
+                print(f"\n[Success] {len(raw_weights)} raw weights exported to {raw_filename}")
+                print(f"[Success] {len(export_array)} merged weights exported to {merged_filename}")
+                print(f"Format: Little-endian int32 (4 bytes per weight)")
 
 # --- 5. CLI Entry Point ---
 if __name__ == "__main__":
