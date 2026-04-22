@@ -52,7 +52,57 @@ def export_kp(raw_weights):
     merged[22528]  = raw_weights[23232]
     return merged
 
+_PP_HALF = 384
+_PP_SS   = _PP_HALF * (_PP_HALF - 1) // 2  # 73536
 
+def _pp_flip(f):
+    pt, sq = f // 64, f % 64
+    return ((pt + 6) % 12) * 64 + (sq ^ 56)
+
+def export_pp(raw_weights):
+    """
+    Decompresses canonical PP weights (147,073 = 2*C(384,2)+1) into a full
+    768*768+1 array for direct engine lookup.
+
+    Each entry out[fi*768 + fj] = sign * w[canonical_index(fi, fj)].
+    Self-symmetric pairs (a == bp in the mixed case) stay 0.
+    The last element is the bias.
+    """
+    out = np.zeros(768 * 768 + 1, dtype=np.int32)
+    out[-1] = raw_weights[-1]  # bias
+
+    for fi in range(768):
+        for fj in range(768):
+            if fi == fj:
+                continue
+
+            si = fi < _PP_HALF
+            sj = fj < _PP_HALF
+            fi_c, fj_c = fi, fj
+            sign = 1
+
+            if si == sj:
+                if not si:                   # both NSTM: fold via vertical flip
+                    fi_c = _pp_flip(fi_c)
+                    fj_c = _pp_flip(fj_c)
+                    sign = -1
+                a, b = min(fi_c, fj_c), max(fi_c, fj_c)
+                idx = b * (b - 1) // 2 + a
+            else:                            # mixed STM/NSTM
+                if not si:
+                    fi_c, fj_c = fj, fi      # fi_c <- STM, fj_c <- NSTM
+                a  = fi_c
+                bp = _pp_flip(fj_c)
+                if a == bp:
+                    continue                  # self-symmetric, stays 0
+                if a > bp:
+                    a, bp = bp, a
+                    sign = -1
+                idx = _PP_SS + bp * (bp - 1) // 2 + a
+
+            out[fi * 768 + fj] = sign * raw_weights[idx]
+
+    return out
 
 
 
@@ -83,7 +133,8 @@ TUNER_BACKENDS = {
     "pp": {
         "func": cpp_tuner.process_batch_pp,
         "num_features": 147073,  # 2 * C(384,2) canonical pairs + 1 bias
-        "export_func": None,
+        "export_func": export_pp,
+        "init_func": cpp_tuner.init_pp_table,
     },
     "ppxk": {
         "func": cpp_tuner.process_batch_ppxk,
@@ -130,6 +181,11 @@ class ChessEngineTuner:
         self.indices = torch.arange(self.total_positions, dtype=torch.int32)
 
     def _setup_optimizer(self):
+        # Run any one-time backend initialisation (e.g. PP lookup table)
+        init_fn = self.backend.get("init_func")
+        if init_fn is not None:
+            init_fn()
+
         # Allocate Weights and explicitly allocate the gradient buffer for C++
         self.weights = torch.zeros(self.num_features, dtype=torch.float32, requires_grad=True)
         self.weights.grad = torch.zeros_like(self.weights)
@@ -190,9 +246,9 @@ class ChessEngineTuner:
                 print(f"\nRaw Weights ({t}):\n", raw_weights)
             else:
                 raw_filename = f"{t}_weights_raw.bin"
-                raw_weights.astype('<i4').tofile(raw_filename)
+                raw_weights.astype(np.int16).astype('<i2').tofile(raw_filename)
                 print(f"\n[Success] {len(raw_weights)} raw weights exported to {raw_filename}")
-                print(f"Format: Little-endian int32 (4 bytes per weight)")
+                print(f"Format: Little-endian int16 (2 bytes per weight)")
         else:
             export_array = export_func(raw_weights)
             if len(raw_weights) < 1000:
@@ -201,11 +257,11 @@ class ChessEngineTuner:
             else:
                 raw_filename = f"{t}_weights_raw.bin"
                 merged_filename = f"{t}_weights_merged.bin"
-                raw_weights.astype('<i4').tofile(raw_filename)
-                export_array.astype('<i4').tofile(merged_filename)
+                raw_weights.astype(np.int16).astype('<i2').tofile(raw_filename)
+                export_array.astype(np.int16).astype('<i2').tofile(merged_filename)
                 print(f"\n[Success] {len(raw_weights)} raw weights exported to {raw_filename}")
                 print(f"[Success] {len(export_array)} merged weights exported to {merged_filename}")
-                print(f"Format: Little-endian int32 (4 bytes per weight)")
+                print(f"Format: Little-endian int16 (2 bytes per weight)")
 
 # --- 5. CLI Entry Point ---
 if __name__ == "__main__":

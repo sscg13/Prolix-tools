@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <cstdint>
+#include <climits>
 #include <string>
 
 #ifdef _MSC_VER
@@ -264,6 +265,50 @@ static inline int pp_flip(int f) {
     return ((pt + 6) % 12) * 64 + (sq ^ 56);
 }
 
+// ====================================================================
+//                      PP Lookup Table
+// ====================================================================
+// Flat [768 * 768] array precomputed once by init_pp_table().
+// Encoding for entry at [fi * 768 + fj]:
+//   INT32_MIN        -> skip (self-symmetric pair, weight pinned to 0)
+//   v >= 0           -> canonical index = v,  sign = +1
+//   v <  0 (else)    -> canonical index = ~v, sign = -1
+//
+// ~2.25 MB; only allocated when the PP backend is used.
+// ====================================================================
+static std::vector<int32_t> g_pp_lut;
+
+static void init_pp_table() {
+    if (!g_pp_lut.empty()) return;
+    g_pp_lut.assign(768 * 768, INT32_MIN);
+
+    for (int fi = 0; fi < 768; ++fi) {
+        for (int fj = 0; fj < 768; ++fj) {
+            if (fi == fj) continue;
+
+            bool si = fi < PP_HALF, sj = fj < PP_HALF;
+            int fi_c = fi, fj_c = fj;
+            int sign = 1;
+            int idx;
+
+            if (si == sj) {
+                if (!si) { fi_c = pp_flip(fi_c); fj_c = pp_flip(fj_c); sign = -1; }
+                int a = std::min(fi_c, fj_c), b = std::max(fi_c, fj_c);
+                idx = b * (b - 1) / 2 + a;
+            } else {
+                if (!si) std::swap(fi_c, fj_c); // fi_c <- STM, fj_c <- NSTM
+                int a  = fi_c;
+                int bp = pp_flip(fj_c);
+                if (a == bp) continue;           // self-symmetric, leave as INT32_MIN
+                if (a > bp) { std::swap(a, bp); sign = -1; }
+                idx = PP_SS + bp * (bp - 1) / 2 + a;
+            }
+
+            g_pp_lut[fi * 768 + fj] = (sign > 0) ? idx : ~idx;
+        }
+    }
+}
+
 struct PPExtractor {
     static constexpr int NUM_FEATURES = PP_SS * 2 + 1; // 147072 pairs + bias
     static constexpr int MAX_ACTIVE   = 32 * 31 / 2 + 1; // C(32,2) pairs + bias
@@ -285,28 +330,16 @@ struct PPExtractor {
             feats[n++] = p * 64 + sq;
         }
 
+        const int32_t* lut = g_pp_lut.data();
         for (int i = 0; i < n; ++i) {
+            const int32_t* row = lut + feats[i] * 768;
             for (int j = i + 1; j < n; ++j) {
-                int fi = feats[i], fj = feats[j];
-                bool si = fi < PP_HALF, sj = fj < PP_HALF;
-                float sign = 1.0f;
+                int32_t v = row[feats[j]];
+                if (v == INT32_MIN) continue; // self-symmetric, skip
                 int idx;
-
-                if (si == sj) {
-                    // Both STM or both NSTM: vertical flip folds NSTM-NSTM into STM-STM.
-                    if (!si) { fi = pp_flip(fi); fj = pp_flip(fj); sign = -1.0f; }
-                    int a = std::min(fi, fj), b = std::max(fi, fj);
-                    idx = b * (b - 1) / 2 + a;
-                } else {
-                    // Mixed: ensure fi is STM, then reduce via flip of the NSTM feature.
-                    if (!si) std::swap(fi, fj);
-                    int a  = fi;
-                    int bp = pp_flip(fj); // flip(NSTM) -> STM feature in [0, PP_HALF)
-                    if (a == bp) continue; // self-symmetric, weight pinned to 0
-                    if (a > bp) { std::swap(a, bp); sign = -1.0f; }
-                    idx = PP_SS + bp * (bp - 1) / 2 + a;
-                }
-
+                float sign;
+                if (v >= 0) { idx = v;  sign =  1.0f; }
+                else        { idx = ~v; sign = -1.0f; }
                 features.add(idx, sign);
                 eval += sign * weights[idx];
             }
@@ -491,6 +524,9 @@ float process_batch_impl(
 
 // 3. Bind to Python
 PYBIND11_MODULE(cpp_tuner, m) {
+    m.def("init_pp_table", &init_pp_table,
+          "Precompute the 768x768 PP canonical-index lookup table. "
+          "Must be called once before using the pp tuner.");
     m.def("process_batch_material", &process_batch_impl<MaterialExtractor>);
     m.def("process_batch_prf", &process_batch_impl<PRFExtractor>);
     m.def("process_batch_psqt", &process_batch_impl<PSTExtractor>);
