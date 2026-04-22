@@ -158,6 +158,75 @@ struct PSTExtractor {
     }
 };
 
+struct KPExtractor {
+    static constexpr int NUM_FEATURES = 23233;
+    static constexpr int MAX_ACTIVE = 129;
+
+    static inline float forward(const UnpackedBoard& board, const float* weights, ActiveFeatures<MAX_ACTIVE>& features) {
+        float eval = 0.0f;
+
+        // --- 1. Global Bias (STM Advantage) ---
+        features.add(23232, 1.0f);
+        eval += weights[23232];
+
+        // --- 2. King Positions ---
+        int k_stm_sq = board.stm_king_sq;
+        int k_nstm_sq = board.nstm_king_sq; // Actual board square
+
+        // --- 3. Compute Mirrored Bucket Indices (0 to 31) ---
+        bool flip_stm = (k_stm_sq % 8) >= 4;
+        int k_stm_mirrored = flip_stm ? (k_stm_sq ^ 7) : k_stm_sq;
+        int k_idx_stm = ((k_stm_mirrored & 56) >> 1) | (k_stm_mirrored & 3);
+
+        // For NSTM, we flip the board vertically first (relative to their forward)
+        int k_nstm_rel = k_nstm_sq ^ 56;
+        bool flip_nstm = (k_nstm_rel % 8) >= 4;
+        int k_nstm_mirrored = flip_nstm ? (k_nstm_rel ^ 7) : k_nstm_rel;
+        int k_idx_nstm = ((k_nstm_mirrored & 56) >> 1) | (k_nstm_mirrored & 3);
+
+        // --- 4. Evaluate All Pieces (Single Pass) ---
+        uint64_t occ = board.occupancy;
+        while (occ) {
+            int sq = get_lsb(occ);
+            occ &= occ - 1;
+
+            uint8_t p = board.mailbox[sq];
+            int base_piece = p % 6;
+            bool is_stm_piece = (p < 6);
+
+            // A. Evaluate from STM's Perspective (Adds to Eval)
+            if (sq != k_stm_sq) { // Never evaluate our own King in our own bucket
+                // Piece Type: 0-4 (Friendly), 5-9 (Enemy), 10 (Enemy King)
+                int pt_stm = (base_piece == 5) ? 10 : (is_stm_piece ? base_piece : base_piece + 5);
+                int sq_stm = flip_stm ? (sq ^ 7) : sq;
+
+                int base_idx_stm = pt_stm * 64 + sq_stm;
+                int kp_idx_stm = 704 + (k_idx_stm * 11 + pt_stm) * 64 + sq_stm;
+
+                features.add(base_idx_stm, 1.0f);
+                features.add(kp_idx_stm, 1.0f);
+                eval += weights[base_idx_stm] + weights[kp_idx_stm];
+            }
+
+            // B. Evaluate from NSTM's Perspective (Subtracts from Eval)
+            if (sq != k_nstm_sq) { // Never evaluate their own King in their own bucket
+                // Piece Type: 0-4 (Friendly to them), 5-9 (Enemy to them), 10 (Enemy King to them)
+                int pt_nstm = (base_piece == 5) ? 10 : (!is_stm_piece ? base_piece : base_piece + 5);
+                int sq_nstm = flip_nstm ? (sq ^ 63) : (sq ^ 56);
+
+                int base_idx_nstm = pt_nstm * 64 + sq_nstm;
+                int kp_idx_nstm = 704 + (k_idx_nstm * 11 + pt_nstm) * 64 + sq_nstm;
+
+                features.add(base_idx_nstm, -1.0f);
+                features.add(kp_idx_nstm, -1.0f);
+                eval -= (weights[base_idx_nstm] + weights[kp_idx_nstm]);
+            }
+        }
+
+        return eval;
+    }
+};
+
 // ====================================================================
 //                         PP Extractor
 // ====================================================================
@@ -337,75 +406,6 @@ struct PPxKExtractor {
             features.add(NUM_PP + nstm_king * 64 + sq, -I_nstm[sq]);
         }
 
-        return eval;
-    }
-};
-
-struct KPExtractor {
-    static constexpr int NUM_FEATURES = 23233; 
-    static constexpr int MAX_ACTIVE = 129; 
-
-    static inline float forward(const UnpackedBoard& board, const float* weights, ActiveFeatures<MAX_ACTIVE>& features) {
-        float eval = 0.0f;
-        
-        // --- 1. Global Bias (STM Advantage) ---
-        features.add(23232, 1.0f);
-        eval += weights[23232];
-
-        // --- 2. King Positions ---
-        int k_stm_sq = board.stm_king_sq;
-        int k_nstm_sq = board.nstm_king_sq; // Actual board square
-
-        // --- 3. Compute Mirrored Bucket Indices (0 to 31) ---
-        bool flip_stm = (k_stm_sq % 8) >= 4;
-        int k_stm_mirrored = flip_stm ? (k_stm_sq ^ 7) : k_stm_sq;
-        int k_idx_stm = ((k_stm_mirrored & 56) >> 1) | (k_stm_mirrored & 3); 
-
-        // For NSTM, we flip the board vertically first (relative to their forward)
-        int k_nstm_rel = k_nstm_sq ^ 56; 
-        bool flip_nstm = (k_nstm_rel % 8) >= 4;
-        int k_nstm_mirrored = flip_nstm ? (k_nstm_rel ^ 7) : k_nstm_rel;
-        int k_idx_nstm = ((k_nstm_mirrored & 56) >> 1) | (k_nstm_mirrored & 3);
-
-        // --- 4. Evaluate All Pieces (Single Pass) ---
-        uint64_t occ = board.occupancy;
-        while (occ) {
-            int sq = get_lsb(occ); 
-            occ &= occ - 1; 
-            
-            uint8_t p = board.mailbox[sq]; 
-            int base_piece = p % 6; 
-            bool is_stm_piece = (p < 6);
-
-            // A. Evaluate from STM's Perspective (Adds to Eval)
-            if (sq != k_stm_sq) { // Never evaluate our own King in our own bucket
-                // Piece Type: 0-4 (Friendly), 5-9 (Enemy), 10 (Enemy King)
-                int pt_stm = (base_piece == 5) ? 10 : (is_stm_piece ? base_piece : base_piece + 5);
-                int sq_stm = flip_stm ? (sq ^ 7) : sq;
-                
-                int base_idx_stm = pt_stm * 64 + sq_stm;
-                int kp_idx_stm = 704 + (k_idx_stm * 11 + pt_stm) * 64 + sq_stm;
-                
-                features.add(base_idx_stm, 1.0f);
-                features.add(kp_idx_stm, 1.0f);
-                eval += weights[base_idx_stm] + weights[kp_idx_stm];
-            }
-
-            // B. Evaluate from NSTM's Perspective (Subtracts from Eval)
-            if (sq != k_nstm_sq) { // Never evaluate their own King in their own bucket
-                // Piece Type: 0-4 (Friendly to them), 5-9 (Enemy to them), 10 (Enemy King to them)
-                int pt_nstm = (base_piece == 5) ? 10 : (!is_stm_piece ? base_piece : base_piece + 5);
-                int sq_nstm = flip_nstm ? (sq ^ 63) : (sq ^ 56);
-                
-                int base_idx_nstm = pt_nstm * 64 + sq_nstm;
-                int kp_idx_nstm = 704 + (k_idx_nstm * 11 + pt_nstm) * 64 + sq_nstm;
-                
-                features.add(base_idx_nstm, -1.0f);
-                features.add(kp_idx_nstm, -1.0f);
-                eval -= (weights[base_idx_nstm] + weights[kp_idx_nstm]);
-            }
-        }
-        
         return eval;
     }
 };
