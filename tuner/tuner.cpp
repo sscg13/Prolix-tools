@@ -118,8 +118,8 @@ struct PRFExtractor {
 };
 
 struct PSTExtractor {
-    static constexpr int NUM_FEATURES = 391; // 1 Bias + 6 Material + 384 Full PST
-    static constexpr int MAX_ACTIVE = 65;    // Max 32 pieces * 2 features + 1 bias
+    static constexpr int NUM_FEATURES = 481; // 1 Bias + 48 Rank + 48 File + 384 PST delta
+    static constexpr int MAX_ACTIVE = 97;    // Max 32 pieces * 3 features + 1 bias
 
     static inline float forward(const UnpackedBoard& board, const float* weights, ActiveFeatures<MAX_ACTIVE>& features) {
         float eval = 0.0f;
@@ -142,13 +142,21 @@ struct PSTExtractor {
             int relative_sq = is_stm ? sq : (sq ^ 56);
             float coeff = is_stm ? 1.0f : -1.0f;
 
-            // Calculate Indices
-            int mat_idx = 1 + base_piece;
-            int pst_idx = 7 + (base_piece * 64) + relative_sq;
+            int file          = relative_sq % 8;
+            int relative_rank = relative_sq / 8;
 
-            // Add Base Material
-            features.add(mat_idx, coeff);
-            eval += coeff * weights[mat_idx];
+            // Calculate Indices
+            int rank_idx = 1  + base_piece * 8  + relative_rank;
+            int file_idx = 49 + base_piece * 8  + file;
+            int pst_idx  = 97 + base_piece * 64 + relative_sq;
+
+            // Add Rank
+            features.add(rank_idx, coeff);
+            eval += coeff * weights[rank_idx];
+
+            // Add File
+            features.add(file_idx, coeff);
+            eval += coeff * weights[file_idx];
 
             // Add PST Delta
             features.add(pst_idx, coeff);
