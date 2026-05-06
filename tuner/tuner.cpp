@@ -124,11 +124,7 @@ struct PSTExtractor {
     static inline float forward(const UnpackedBoard& board, const float* weights, ActiveFeatures<MAX_ACTIVE>& features) {
         float eval = 0.0f;
 
-        // --- 1. Global Bias ---
-        features.add(0, 1.0f);
-        eval += weights[0];
-
-        // --- 2. Extract Factorized Features ---
+        // --- 1. Extract Factorized Features ---
         uint64_t occ = board.occupancy;
         while (occ) {
             int sq = get_lsb(occ);
@@ -146,9 +142,9 @@ struct PSTExtractor {
             int relative_rank = relative_sq / 8;
 
             // Calculate Indices
-            int rank_idx = 1  + base_piece * 8  + relative_rank;
-            int file_idx = 49 + base_piece * 8  + file;
-            int pst_idx  = 97 + base_piece * 64 + relative_sq;
+            int rank_idx = base_piece * 8  + relative_rank;
+            int file_idx = 48 + base_piece * 8  + file;
+            int pst_idx  = 96 + base_piece * 64 + relative_sq;
 
             // Add Rank
             features.add(rank_idx, coeff);
@@ -162,6 +158,10 @@ struct PSTExtractor {
             features.add(pst_idx, coeff);
             eval += coeff * weights[pst_idx];
         }
+
+        // --- 2. Global Bias ---
+        features.add(480, 1.0f);
+        eval += weights[480];
 
         return eval;
     }

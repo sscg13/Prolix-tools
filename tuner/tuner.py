@@ -13,28 +13,28 @@ import cpp_tuner
 
 def export_psqt(raw_weights):
     """
-    Merges factorized PST weights (481 features: 1 bias + 48 rank + 48 file + 384 PST delta)
+    Merges factorized PST weights (481 features: 48 rank + 48 file + 384 PST delta + 1 bias)
     into a flat PST array (385 features) for engine evaluation.
 
     Raw layout:
-      [0]                        : bias
-      [1  + p*8 + relative_rank] : rank value  (p in 0..5, relative_rank in 0..7)
-      [49 + p*8 + file]          : file value  (file in 0..7)
-      [97 + p*64 + relative_sq]  : PST delta
+      [p*8 + relative_rank]      : rank value  (p in 0..5, relative_rank in 0..7)
+      [48 + p*8 + file]          : file value  (file in 0..7)
+      [96 + p*64 + relative_sq]  : PST delta
+      [480]                      : bias
     """
     merged_weights = np.zeros(385, dtype=np.int32)
 
-    # Map Bias (Training index 0 -> Engine index 384)
-    merged_weights[384] = raw_weights[0]
+    # Map Bias (Training index 480 -> Engine index 384)
+    merged_weights[384] = raw_weights[480]
 
     # Merge Rank + File + PST delta into Flat PST
     for p in range(6):
         for sq in range(64):
             file          = sq % 8
             relative_rank = sq // 8
-            rank_val  = raw_weights[1  + p * 8  + relative_rank]
-            file_val  = raw_weights[49 + p * 8  + file]
-            pst_delta = raw_weights[97 + p * 64 + sq]
+            rank_val  = raw_weights[p * 8  + relative_rank]
+            file_val  = raw_weights[48 + p * 8  + file]
+            pst_delta = raw_weights[96 + p * 64 + sq]
             merged_weights[p * 64 + sq] = rank_val + file_val + pst_delta
 
     return merged_weights
