@@ -1,5 +1,6 @@
 import argparse
 import collections
+import math
 import time
 import numpy as np
 import torch
@@ -122,31 +123,36 @@ def export_pp(raw_weights):
 TUNER_BACKENDS = {
     "material": {
         "func": cpp_tuner.process_batch_material,
-        "num_features": 7,  # 6 pieces + 1 bias
+        "num_features": 7,    # 6 pieces + 1 bias
+        "max_active": 33,     # 32 pieces + 1 bias
         "export_func": None,
         "default_steps": 1_000,
     },
     "prf": {
         "func": cpp_tuner.process_batch_prf,
-        "num_features": 97,  # 48 file + 48 rank + 1 bias
+        "num_features": 97,   # 48 file + 48 rank + 1 bias
+        "max_active": 65,     # 32 pieces * 2 features + 1 bias
         "export_func": None,
         "default_steps": 5_000,
     },
     "psqt": {
         "func": cpp_tuner.process_batch_psqt,
         "num_features": 481,  # 1 bias + 48 rank + 48 file + 6 pieces * 64 squares
+        "max_active": 97,     # 32 pieces * 3 features + 1 bias
         "export_func": export_psqt,
         "default_steps": 10_000,
     },
     "kp": {
         "func": cpp_tuner.process_batch_kp,
         "num_features": 23233,  # 704 base + 32 * 704 buckets + 1 bias
+        "max_active": 129,      # 32 pieces * 4 features + 1 bias
         "export_func": export_kp,
         "default_steps": 50_000,
     },
     "pp": {
         "func": cpp_tuner.process_batch_pp,
         "num_features": 147073,  # 2 * C(384,2) canonical pairs + 1 bias
+        "max_active": 497,       # C(32,2) pairs + 1 bias
         "export_func": export_pp,
         "init_func": cpp_tuner.init_pp_table,
         "default_steps": 50_000,
@@ -154,6 +160,7 @@ TUNER_BACKENDS = {
     "ppxk": {
         "func": cpp_tuner.process_batch_ppxk,
         "num_features": 593921,  # 768*768 PP + 64*64 K + 1 bias
+        "max_active": 2113,      # 2*(32*31) ordered W pairs + 2*64 K features + 1 bias
         "export_func": None,
         "default_steps": 50_000,
     },
@@ -203,8 +210,11 @@ class ChessEngineTuner:
         if init_fn is not None:
             init_fn()
 
-        # Allocate Weights and explicitly allocate the gradient buffer for C++
+        # Allocate weights with small random init: std = 1/sqrt(max_active)
+        # keeps initial eval variance at ~1 regardless of feature density.
+        std = 1.0 / math.sqrt(self.backend["max_active"])
         self.weights = torch.zeros(self.num_features, dtype=torch.float32, requires_grad=True)
+        self.weights.data.normal_(0.0, std)
         self.weights.grad = torch.zeros_like(self.weights)
         self.optimizer = optim.Adam([self.weights], lr=self.config.lr)
 
