@@ -1,4 +1,5 @@
 import argparse
+import collections
 import time
 import numpy as np
 import torch
@@ -123,32 +124,38 @@ TUNER_BACKENDS = {
         "func": cpp_tuner.process_batch_material,
         "num_features": 7,  # 6 pieces + 1 bias
         "export_func": None,
+        "default_steps": 1_000,
     },
     "prf": {
         "func": cpp_tuner.process_batch_prf,
         "num_features": 97,  # 48 file + 48 rank + 1 bias
         "export_func": None,
+        "default_steps": 5_000,
     },
     "psqt": {
         "func": cpp_tuner.process_batch_psqt,
         "num_features": 481,  # 1 bias + 48 rank + 48 file + 6 pieces * 64 squares
         "export_func": export_psqt,
+        "default_steps": 10_000,
     },
     "kp": {
         "func": cpp_tuner.process_batch_kp,
         "num_features": 23233,  # 704 base + 32 * 704 buckets + 1 bias
         "export_func": export_kp,
+        "default_steps": 50_000,
     },
     "pp": {
         "func": cpp_tuner.process_batch_pp,
         "num_features": 147073,  # 2 * C(384,2) canonical pairs + 1 bias
         "export_func": export_pp,
         "init_func": cpp_tuner.init_pp_table,
+        "default_steps": 50_000,
     },
     "ppxk": {
         "func": cpp_tuner.process_batch_ppxk,
         "num_features": 593921,  # 768*768 PP + 64*64 K + 1 bias
         "export_func": None,
+        "default_steps": 50_000,
     },
 }
 
@@ -157,8 +164,9 @@ TUNER_BACKENDS = {
 class TunerConfig:
     file_path: str
     tuner_type: str
-    epochs: int
+    steps: int
     batch_size: int
+    window_size: int
     lr: float
     k: float
     lambda_val: float
@@ -201,45 +209,53 @@ class ChessEngineTuner:
         self.optimizer = optim.Adam([self.weights], lr=self.config.lr)
 
     def train(self):
-        print(f"\nStarting Training [{self.config.tuner_type.upper()} Tuner]...")
+        cfg = self.config
+        print(f"\nStarting Training [{cfg.tuner_type.upper()} Tuner] | {cfg.steps:,} steps...")
 
-        for epoch in range(self.config.epochs):
-            total_loss = 0.0
-            positions_processed = 0
-            start_time = time.perf_counter()
+        loss_window = collections.deque(maxlen=cfg.window_size)
+        log_interval = max(1, cfg.steps // 100)
 
-            # Shuffle indices at the start of every epoch
-            self.indices = self.indices[torch.randperm(self.total_positions)]
+        # Initial shuffle
+        self.indices = self.indices[torch.randperm(self.total_positions)]
+        dataset_pos = 0
 
-            for start_idx in range(0, self.total_positions, self.config.batch_size):
-                current_batch_size = min(self.config.batch_size, self.total_positions - start_idx)
+        interval_positions = 0
+        interval_start = time.perf_counter()
 
-                self.weights.grad.zero_()
+        for step in range(cfg.steps):
+            # Reshuffle and wrap around when dataset is exhausted
+            if dataset_pos + cfg.batch_size > self.total_positions:
+                self.indices = self.indices[torch.randperm(self.total_positions)]
+                dataset_pos = 0
 
-                # The C++ Black Box
-                batch_loss = self.cpp_process_func(
-                    start_idx,
-                    current_batch_size,
-                    self.config.k,
-                    self.config.lambda_val,
-                    self.weights,
-                    self.weights.grad,
-                    self.dataset_tensor,
-                    self.indices
-                )
+            current_batch_size = min(cfg.batch_size, self.total_positions - dataset_pos)
 
-                self.optimizer.step()
+            self.weights.grad.zero_()
 
-                total_loss += batch_loss * current_batch_size
-                positions_processed += current_batch_size
+            batch_loss = self.cpp_process_func(
+                dataset_pos,
+                current_batch_size,
+                cfg.k,
+                cfg.lambda_val,
+                self.weights,
+                self.weights.grad,
+                self.dataset_tensor,
+                self.indices,
+            )
 
-            # Logging
-            elapsed_time = time.perf_counter() - start_time
-            pos_per_sec = positions_processed / elapsed_time
-            avg_loss = total_loss / self.total_positions
+            self.optimizer.step()
 
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1:4d}/{self.config.epochs} | Loss: {avg_loss:.6f} | Speed: {pos_per_sec:,.0f} pos/sec")
+            loss_window.append(batch_loss)
+            interval_positions += current_batch_size
+            dataset_pos += current_batch_size
+
+            if (step + 1) % log_interval == 0:
+                elapsed = time.perf_counter() - interval_start
+                pos_per_sec = interval_positions / elapsed
+                avg_loss = sum(loss_window) / len(loss_window)
+                print(f"Step {step+1:6d}/{cfg.steps} | Loss: {avg_loss:.6f} | Speed: {pos_per_sec:,.0f} pos/sec")
+                interval_positions = 0
+                interval_start = time.perf_counter()
 
         print("\nTraining Complete!")
 
@@ -278,22 +294,26 @@ if __name__ == "__main__":
 
     parser.add_argument("--data", type=str, default="data.bin", help="Path to the binary dataset")
     parser.add_argument("--tuner", type=str, choices=TUNER_BACKENDS.keys(), default="material", help="Which feature extractor to use")
-    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
+    parser.add_argument("--steps", type=int, default=None, help="Number of training steps (batches); defaults per tuner type if omitted")
     parser.add_argument("--batch-size", type=int, default=16384, help="Positions per batch")
+    parser.add_argument("--window", type=int, default=200, help="Sliding window size for loss averaging")
     parser.add_argument("--lr", type=float, default=0.001, help="AdamW learning rate")
     parser.add_argument("--k", type=float, default=400.0, help="Sigmoid scaling factor")
     parser.add_argument("--lam", type=float, default=1.0, help="WDL interpolation lambda")
 
     args = parser.parse_args()
 
+    steps = args.steps if args.steps is not None else TUNER_BACKENDS[args.tuner]["default_steps"]
+
     config = TunerConfig(
         file_path=args.data,
         tuner_type=args.tuner,
-        epochs=args.epochs,
+        steps=steps,
         batch_size=args.batch_size,
+        window_size=args.window,
         lr=args.lr,
         k=args.k,
-        lambda_val=args.lam
+        lambda_val=args.lam,
     )
 
     tuner = ChessEngineTuner(config)
