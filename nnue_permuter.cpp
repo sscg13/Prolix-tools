@@ -93,19 +93,6 @@ static Position parse_fen(const std::string &line) {
   return p;
 }
 
-static void pack_avx2_layout(std::array<I16, L1> &v) {
-  constexpr std::array<int, 8> order = {0, 1, 4, 5, 2, 3, 6, 7};
-  for (int base = 0; base < L1; base += 32) {
-    std::array<I16, 32> source{};
-    std::memcpy(source.data(), v.data() + base, sizeof(source));
-    for (int chunk = 0; chunk < 8; chunk++) {
-      for (int i = 0; i < 4; i++) {
-        v[base + 4 * chunk + i] = source[4 * order[chunk] + i];
-      }
-    }
-  }
-}
-
 class Net {
 public:
   explicit Net(const std::string &path) {
@@ -119,7 +106,6 @@ public:
   std::array<U64, 8> zeroes(const Position &p, int color) const {
     std::array<I16, L1> acc{};
     std::memcpy(acc.data(), bytes.data() + BiasOffset, sizeof(acc));
-    pack_avx2_layout(acc);
     int bucket = KingBuckets[(56 * color) ^ p.king[color]],
         raw_bucket = bucket / 2;
     for (const Piece &piece : p.pieces) {
@@ -131,7 +117,6 @@ public:
       std::array<I16, L1> weights{};
       std::memcpy(weights.data(), bytes.data() + vector * L1 * sizeof(I16),
                   sizeof(weights));
-      pack_avx2_layout(weights);
       for (int i = 0; i < L1; i++) {
         acc[i] = add_wrap(acc[i], weights[i]);
       }
